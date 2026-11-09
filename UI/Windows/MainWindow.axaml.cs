@@ -45,6 +45,8 @@ namespace Mesen.Windows
 		private bool _needResume = false;
 		private bool _needCloseValidation = true;
 		private bool _isClosing = false;
+		private PosixSignalRegistration? _sigTermRegistration;
+		private int _closeSignalCount = 0;
 
 		private bool _preventFullscreenToggle = false;
 
@@ -109,6 +111,11 @@ namespace Mesen.Windows
 			ConfigManager.Config.MainWindow.LoadWindowSettings(this);
 
 			Console.CancelKeyPress += Console_CancelKeyPress;
+			if(!OperatingSystem.IsWindows()) {
+				//SIGTERM (logout, systemctl stop, kill, or a launcher closing the game) used to end the process at once,
+				//losing battery saves made since the game was loaded. Close the same way as Ctrl+C instead.
+				_sigTermRegistration = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => ctx.Cancel = CloseFromSignal());
+			}
 
 #if DEBUG
 			this.AttachDevTools();
@@ -184,14 +191,29 @@ namespace Mesen.Windows
 		{
 			base.OnClosed(e);
 			_mouseManager?.Dispose();
+			_sigTermRegistration?.Dispose();
 		}
 
 		private void Console_CancelKeyPress(object? sender, ConsoleCancelEventArgs e)
 		{
-			_needCloseValidation = false;
+			e.Cancel = CloseFromSignal();
+		}
+
+		//Ctrl+C / SIGTERM: close like the window's close button (without the exit confirmation), so the emulator stops
+		//normally and writes the battery save and settings. Returning true keeps the runtime from ending the process
+		//before that has happened (the old handler only queued the work, then the process was killed right away).
+		//A second signal is not cancelled, so it still ends a Mesen that is stuck.
+		private bool CloseFromSignal()
+		{
+			if(Interlocked.Increment(ref _closeSignalCount) > 1) {
+				return false;
+			}
+
 			Dispatcher.UIThread.Post(() => {
-				CloseEmu(true);
+				_needCloseValidation = false;
+				Close();
 			});
+			return true;
 		}
 
 		private void OnDrop(object? sender, DragEventArgs e)

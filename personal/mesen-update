@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# mesen-update [sync|build|test|install|all]   (no argument = build, test, install)
+#
+# Builds ToddoUwU/MesenCE (branch PersonalUpdates, ~/MesenCE) from source and installs the single Mesen binary into
+# every Quiver game folder that runs it. Started 2026-11-09 for Kirby's Adventure.
+#
+#   sync     merge the newest upstream MesenCE release tag (nesdev-org/MesenCE) into PersonalUpdates and push the fork;
+#            stops on a merge conflict (merge aborted, nothing changed). Upstream is read-only: its push URL is disabled.
+#   build    make: NativeAOT like the official release, clang + thin LTO, but STATICLINK=false. The release links its own
+#            copy of libstdc++ (GCC 12, Ubuntu 22.04) into MesenCore.so; on this system (GCC 14 libstdc++) that copy clashes
+#            with the one .NET loads and Mesen dies at startup with std::bad_cast. Linking the system library fixes it.
+#            Runs in a memory-capped user scope (20 GB, no swap) with 10 jobs.
+#   test     headless: load a ROM with --testRunner and a Lua script that exits after 120 frames (no window, no audio).
+#   install  copy the binary into each game folder in APPS (refuses while that Mesen is running) and record the build.
+#   all      sync, build, test, install.
+set -euo pipefail
+
+REPO=$HOME/MesenCE
+APPS=("$HOME/.local/share/QuiverLauncher/Apps/KirbysAdventure-MesenCE")
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/mesence
+OUT=$REPO/bin/linux-x64/Release/linux-x64/publish/Mesen
+JOBS=${MESEN_JOBS:-10}
+UPSTREAM_REPO=nesdev-org/MesenCE
+
+mkdir -p "$STATE"
+log() { printf '[mesen-update] %s\n' "$*"; }
+die() { printf '[mesen-update] ERROR: %s\n' "$*" >&2; exit 1; }
+
+sync_fork() {
+  cd "$REPO"
+  [[ $(git branch --show-current) == PersonalUpdates ]] || die "~/MesenCE is not on PersonalUpdates"
+  git diff --quiet && git diff --cached --quiet || die "uncommitted changes in ~/MesenCE; commit them first"
+  git fetch --quiet upstream --tags
+  # Newest release (not prerelease) by the upstream GitHub releases list; falls back to the highest x.y.z tag.
+  local tag
+  tag=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq .tag_name 2>/dev/null) ||
+    tag=$(git tag --list '[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+  [[ -n $tag ]] || die "could not find an upstream release tag"
+  if git merge-base --is-ancestor "$tag" HEAD; then
+    log "already has upstream release $tag"
+  else
+    log "merging upstream release $tag into PersonalUpdates"
+    if ! git merge --no-edit -m "Merge upstream MesenCE release $tag into PersonalUpdates" "$tag"; then
+      git merge --abort
+      die "merge conflict with $tag; merge aborted, nothing changed. Resolve it by hand."
+    fi
+  fi
+  git push --quiet origin PersonalUpdates
+}
+
+build() {
+  cd "$REPO"
+  git rev-parse HEAD >UI/Dependencies/Internal/BuildSha.txt # shown in Help > About, as the official builds do
+  log "building $(git describe --tags --always) with $JOBS jobs (log: $STATE/build.log)"
+  export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
+  if ! systemd-run --user --scope --quiet --collect --unit="mesence-build-$$" -p MemoryMax=20G -p MemorySwapMax=0 \
+      nice -n 10 make -j"$JOBS" USE_AOT=true LTO=true STATICLINK=false SYSTEM_LIBEVDEV=false >"$STATE/build.log" 2>&1; then
+    tail -30 "$STATE/build.log" >&2
+    die "build failed (full log: $STATE/build.log)"
+  fi
+  [[ -x $OUT ]] || die "build finished but $OUT is missing"
+  log "built $OUT ($(du -h "$OUT" | cut -f1))"
+}
+
+test_build() {
+  # A ROM from the first game folder's play-* wrapper (ROM="..." line).
+  local rom work rc
+  rom=$(sed -n 's/^ROM="\(.*\)"$/\1/p' "${APPS[0]}"/play-* 2>/dev/null | head -1)
+  [[ -f $rom ]] || die "test ROM not found (${rom:-no ROM= line in ${APPS[0]}/play-*})"
+  work=$(mktemp -d "${TMPDIR:-/tmp}/mesence-test.XXXXXX")
+  cp "$OUT" "$work/Mesen"
+  echo '{"ConfigUpgrade":1}' >"$work/settings.json" # portable mode in the scratch folder: the real settings stay untouched
+  cat >"$work/frames.lua" <<'LUA'
+local frames = 0
+emu.addEventCallback(function()
+  frames = frames + 1
+  if frames >= 120 then emu.stop(42) end
+end, emu.eventType.endFrame)
+LUA
+  set +e
+  (cd "$work" && env -u DISPLAY -u WAYLAND_DISPLAY timeout 60 ./Mesen --testRunner --timeout=30 frames.lua "$rom" >"$work/out.log" 2>&1)
+  rc=$?
+  set -e
+  if ((rc != 42)); then
+    cat "$work/out.log" >&2
+    die "test run failed (exit $rc, expected 42 after 120 frames); scratch folder kept: $work"
+  fi
+  rm -rf "$work"
+  log "test passed: core loaded and ran 120 frames"
+}
+
+install_build() {
+  local app sha
+  sha=$(git -C "$REPO" rev-parse --short HEAD)
+  for app in "${APPS[@]}"; do
+    [[ -d $app ]] || { log "skip $app (missing)"; continue; }
+    if pgrep -u "$USER" -f "^$app/Mesen( |$)" >/dev/null || pgrep -u "$USER" -x Mesen -a | grep -q "$app/"; then
+      die "Mesen is running from $app; close it first"
+    fi
+    cp "$OUT" "$app/Mesen.new" && chmod 755 "$app/Mesen.new" && mv -f "$app/Mesen.new" "$app/Mesen"
+    printf '%s\n%s %s\n' "$(git -C "$REPO" describe --tags --always)" "$sha" "$(date -Is)" >"$app/mesen-build.txt"
+    log "installed into $app"
+  done
+}
+
+case ${1:-} in
+  sync) sync_fork ;;
+  build) build ;;
+  test) test_build ;;
+  install) install_build ;;
+  all) sync_fork; build; test_build; install_build ;;
+  "") build; test_build; install_build ;;
+  *) sed -n '2,16p' "$0"; exit 2 ;;
+esac

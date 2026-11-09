@@ -1,4 +1,6 @@
 ﻿#include <algorithm>
+#include <climits>
+#include <unistd.h>
 #include "LinuxKeyManager.h"
 #include "LinuxGameController.h"
 #include "Utilities/FolderUtilities.h"
@@ -37,7 +39,15 @@ LinuxKeyManager::LinuxKeyManager(Emulator* emu)
 
 	for(KeyDefinition& keyDef : _keyDefinitions) {
 		_keyNames[keyDef.keyCode] = keyDef.name;
-		_keyCodes[keyDef.name] = keyDef.keyCode;
+		//First definition wins: the analog axis names at the end of the pad list ("Y", "X", "Y2", ...) reuse button names,
+		//and overwriting made "PadN X"/"PadN Y" resolve to axis codes that never read as pressed (Xbox preset turbo keys).
+		_keyCodes.emplace(keyDef.name, keyDef.keyCode);
+	}
+
+	//The default Xbox layout binds Select to "PadN Back" (its name on other platforms); on Linux that button is "PadN Select".
+	for(int i = 0; i < 20; i++) {
+		string pad = "Pad" + std::to_string(i + 1) + " ";
+		_keyCodes.emplace(pad + "Back", _keyCodes[pad + "Select"]);
 	}
 
 	CheckForGamepads(true);
@@ -145,6 +155,7 @@ void LinuxKeyManager::CheckForGamepads(bool logInformation)
 		}
 	}
 
+	vector<int> newIDs;
 	vector<string> files = FolderUtilities::GetFilesInFolder("/dev/input/", {}, false);
 	for(size_t i = 0; i < files.size(); i++) {
 		string filename = FolderUtilities::GetFilename(files[i], false);
@@ -157,13 +168,45 @@ void LinuxKeyManager::CheckForGamepads(bool logInformation)
 			}
 
 			if(std::find(connectedIDs.begin(), connectedIDs.end(), deviceId) == connectedIDs.end()) {
-				std::shared_ptr<LinuxGameController> controller = LinuxGameController::GetController(_emu, deviceId, logInformation);
-				if(controller) {
-					_controllers.push_back(controller);
-				}
+				newIDs.push_back(deviceId);
 			}
 		}
 	}
+
+	//Number pads in the order they were connected. The directory listing has no useful order (the newest node usually
+	//comes first), so which controller became Pad1 changed from run to run when several were present.
+	std::sort(newIDs.begin(), newIDs.end(), [](int a, int b) {
+		int inputA = GetInputDeviceNumber(a);
+		int inputB = GetInputDeviceNumber(b);
+		return inputA != inputB ? inputA < inputB : a < b;
+	});
+
+	for(int deviceId : newIDs) {
+		std::shared_ptr<LinuxGameController> controller = LinuxGameController::GetController(_emu, deviceId, logInformation);
+		if(controller) {
+			_controllers.push_back(controller);
+		}
+	}
+}
+
+int LinuxKeyManager::GetInputDeviceNumber(int eventId)
+{
+	//The kernel numbers input devices (the "inputN" parent of /dev/input/eventX) with a counter that only goes up,
+	//unlike event numbers, which get reused. Sorting by it lists devices in connection order.
+	char target[512] = {};
+	string link = "/sys/class/input/event" + std::to_string(eventId) + "/device";
+	ssize_t len = readlink(link.c_str(), target, sizeof(target) - 1);
+	if(len > 0) {
+		string path(target, len);
+		size_t pos = path.rfind("input");
+		if(pos != string::npos) {
+			try {
+				return std::stoi(path.substr(pos + 5));
+			} catch(std::exception&) {
+			}
+		}
+	}
+	return INT_MAX;
 }
 
 void LinuxKeyManager::StartUpdateDeviceThread()

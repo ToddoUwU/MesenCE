@@ -27,6 +27,7 @@ private:
 
 	void StartUpdateDeviceThread();
 	void CheckForGamepads(bool logInformation);
+	static int GetInputDeviceNumber(int eventId);
 
 public:
 	LinuxKeyManager(Emulator* emu);

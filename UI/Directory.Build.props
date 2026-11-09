@@ -1,0 +1,15 @@
+<Project>
+  <!--
+    PersonalUpdates (ToddoUwU/MesenCE): NativeAOT builds use the patched .NET 8 runtime.
+    NativeAOT compiles the .NET runtime (its Brotli decoder included) into the Mesen binary. 8.0.33 fixes
+    CVE-2026-111497 / GHSA-p3jp-9v83-76w9 (Brotli decoder out-of-bounds write) in every 8.0.x before it. The .NET 10
+    SDK used on this machine (global.json rolls forward to it) still picks 8.0.32, which NuGet's audit rejects.
+    Raise both versions together when a newer 8.0.x patch ships.
+  -->
+  <PropertyGroup Condition="'$(PublishAot)' == 'true'">
+    <RuntimeFrameworkVersion>8.0.33</RuntimeFrameworkVersion>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(PublishAot)' == 'true'">
+    <PackageReference Include="Microsoft.DotNet.ILCompiler" Version="8.0.33" />
+  </ItemGroup>
+</Project>

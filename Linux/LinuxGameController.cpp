@@ -13,6 +13,41 @@
 #include <fcntl.h>
 #include <iostream>
 
+//Same idea as udev's ID_INPUT_JOYSTICK: a device counts as a controller when it has joystick or gamepad buttons and is
+//not a pointer (mouse, touchscreen, touchpad, pen tablet) or a motion sensor. Matching any device with an ABS_X axis
+//let absolute mice, touchscreens, pen tablets, controller touchpads/motion sensors and some RGB/LED controllers take
+//pad slots, so "Pad1" was often not a controller at all (e.g. Sunshine/Moonlight's virtual mouse and pen devices).
+static bool IsGameController(libevdev* device)
+{
+	if(libevdev_has_property(device, INPUT_PROP_POINTER) || libevdev_has_property(device, INPUT_PROP_DIRECT) ||
+		libevdev_has_property(device, INPUT_PROP_ACCELEROMETER)) {
+		return false;
+	}
+
+	if(!libevdev_has_event_type(device, EV_KEY)) {
+		return false;
+	}
+
+	for(unsigned int code : { BTN_TOUCH, BTN_TOOL_PEN, BTN_TOOL_FINGER, BTN_STYLUS, BTN_MOUSE }) {
+		if(libevdev_has_event_code(device, EV_KEY, code)) {
+			return false;
+		}
+	}
+
+	//BTN_JOYSTICK (0x120) to BTN_THUMBR (0x13e) covers joystick and gamepad buttons
+	for(unsigned int code = BTN_JOYSTICK; code <= BTN_THUMBR; code++) {
+		if(libevdev_has_event_code(device, EV_KEY, code)) {
+			return true;
+		}
+	}
+	for(unsigned int code = BTN_TRIGGER_HAPPY1; code <= BTN_TRIGGER_HAPPY40; code++) {
+		if(libevdev_has_event_code(device, EV_KEY, code)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 std::shared_ptr<LinuxGameController> LinuxGameController::GetController(Emulator* emu, int deviceID, bool logInformation)
 {
 	std::string deviceName = "/dev/input/event" + std::to_string(deviceID);
@@ -36,8 +71,7 @@ std::shared_ptr<LinuxGameController> LinuxGameController::GetController(Emulator
 			return nullptr;
 		}
 
-		if((libevdev_has_event_type(device, EV_KEY) && libevdev_has_event_code(device, EV_KEY, BTN_GAMEPAD)) ||
-			(libevdev_has_event_type(device, EV_ABS) && libevdev_has_event_code(device, EV_ABS, ABS_X))) {
+		if(IsGameController(device)) {
 			MessageManager::Log(std::string("[Input Connected] Name: ") + libevdev_get_name(device) + " Vendor: " + std::to_string(libevdev_get_id_vendor(device)) + " Product: " + std::to_string(libevdev_get_id_product(device)));
 			return std::shared_ptr<LinuxGameController>(new LinuxGameController(emu, deviceID, fd, device));
 		} else {

@@ -10,42 +10,95 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <fcntl.h>
+#include <fstream>
 #include <iostream>
+#include <string>
 
-//Same idea as udev's ID_INPUT_JOYSTICK: a device counts as a controller when it has joystick or gamepad buttons and is
-//not a pointer (mouse, touchscreen, touchpad, pen tablet) or a motion sensor. Matching any device with an ABS_X axis
-//let absolute mice, touchscreens, pen tablets, controller touchpads/motion sensors and some RGB/LED controllers take
-//pad slots, so "Pad1" was often not a controller at all (e.g. Sunshine/Moonlight's virtual mouse and pen devices).
-static bool IsGameController(libevdev* device)
+//Which input devices are controllers. Matching any device with an ABS_X axis (the old rule) let absolute mice,
+//touchscreens, pen tablets, controller touchpads/motion sensors and RGB/LED controllers take pad slots, so "Pad1" was
+//often not a controller at all (e.g. Sunshine/Moonlight's virtual mouse, pen and touch devices, or ASRock's motherboard
+//LED controller, which reports Select/Start buttons and 8 axes).
+
+//Joystick/gamepad buttons, counted like udev does (a mouse whose buttons overflow into the joystick range counts none).
+static int CountJoystickButtons(libevdev* device)
 {
+	if(!libevdev_has_event_type(device, EV_KEY) || libevdev_has_event_code(device, EV_KEY, BTN_JOYSTICK - 1)) {
+		return 0;
+	}
+
+	int count = 0;
+	for(unsigned int code = BTN_JOYSTICK; code < BTN_DIGI; code++) {
+		count += libevdev_has_event_code(device, EV_KEY, code) ? 1 : 0;
+	}
+	for(unsigned int code = BTN_TRIGGER_HAPPY1; code <= BTN_TRIGGER_HAPPY40; code++) {
+		count += libevdev_has_event_code(device, EV_KEY, code) ? 1 : 0;
+	}
+	for(unsigned int code = BTN_DPAD_UP; code <= BTN_DPAD_RIGHT; code++) {
+		count += libevdev_has_event_code(device, EV_KEY, code) ? 1 : 0;
+	}
+	return count;
+}
+
+//udev's verdict (ID_INPUT_JOYSTICK in its database), the same source SDL and Steam go by. Besides its capability rules,
+//udev applies a list of devices known to look like joysticks without being one (the ASRock LED controller is on it).
+//Returns -1 when udev has no entry for the device (no udev, e.g. some containers).
+static int GetUdevJoystickFlag(dev_t rdev)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/run/udev/data/c%u:%u", major(rdev), minor(rdev));
+	std::ifstream file(path);
+	if(!file) {
+		return -1;
+	}
+
+	std::string line;
+	while(std::getline(file, line)) {
+		if(line == "E:ID_INPUT_JOYSTICK=1") {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static bool IsGameController(libevdev* device, dev_t rdev)
+{
+	//A device without any button is no use as a pad. udev flags some of those as joysticks too (e.g. a keyboard's
+	//"System Control" node that only has two axes), and they would take pad slots ahead of real controllers.
+	int buttons = CountJoystickButtons(device);
+	if(buttons == 0) {
+		return false;
+	}
+
+	int udevFlag = GetUdevJoystickFlag(rdev);
+	if(udevFlag >= 0) {
+		return udevFlag == 1;
+	}
+
+	//No udev: a short version of its rule. Not a pointer (mouse, touchscreen, touchpad, pen) or motion sensor...
 	if(libevdev_has_property(device, INPUT_PROP_POINTER) || libevdev_has_property(device, INPUT_PROP_DIRECT) ||
 		libevdev_has_property(device, INPUT_PROP_ACCELEROMETER)) {
 		return false;
 	}
-
-	if(!libevdev_has_event_type(device, EV_KEY)) {
-		return false;
-	}
-
 	for(unsigned int code : { BTN_TOUCH, BTN_TOOL_PEN, BTN_TOOL_FINGER, BTN_STYLUS, BTN_MOUSE }) {
 		if(libevdev_has_event_code(device, EV_KEY, code)) {
 			return false;
 		}
 	}
 
-	//BTN_JOYSTICK (0x120) to BTN_THUMBR (0x13e) covers joystick and gamepad buttons
-	for(unsigned int code = BTN_JOYSTICK; code <= BTN_THUMBR; code++) {
-		if(libevdev_has_event_code(device, EV_KEY, code)) {
-			return true;
-		}
+	//...not a keyboard (udev's "well-known keys")...
+	int keyboardKeys = 0;
+	for(unsigned int code : { KEY_LEFTCTRL, KEY_CAPSLOCK, KEY_NUMLOCK, KEY_INSERT, KEY_MUTE, KEY_CALC, KEY_FILE, KEY_MAIL, KEY_PLAYPAUSE, KEY_BRIGHTNESSDOWN }) {
+		keyboardKeys += libevdev_has_event_code(device, EV_KEY, code) ? 1 : 0;
 	}
-	for(unsigned int code = BTN_TRIGGER_HAPPY1; code <= BTN_TRIGGER_HAPPY40; code++) {
-		if(libevdev_has_event_code(device, EV_KEY, code)) {
-			return true;
-		}
+
+	//...and at least two joystick buttons/axes in all.
+	int axes = 0;
+	for(unsigned int code = ABS_RX; code < ABS_PRESSURE; code++) {
+		axes += libevdev_has_event_code(device, EV_ABS, code) ? 1 : 0;
 	}
-	return false;
+	return keyboardKeys < 4 && buttons + axes >= 2;
 }
 
 std::shared_ptr<LinuxGameController> LinuxGameController::GetController(Emulator* emu, int deviceID, bool logInformation)
@@ -71,7 +124,7 @@ std::shared_ptr<LinuxGameController> LinuxGameController::GetController(Emulator
 			return nullptr;
 		}
 
-		if(IsGameController(device)) {
+		if(IsGameController(device, buffer.st_rdev)) {
 			MessageManager::Log(std::string("[Input Connected] Name: ") + libevdev_get_name(device) + " Vendor: " + std::to_string(libevdev_get_id_vendor(device)) + " Product: " + std::to_string(libevdev_get_id_product(device)));
 			return std::shared_ptr<LinuxGameController>(new LinuxGameController(emu, deviceID, fd, device));
 		} else {
